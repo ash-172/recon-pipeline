@@ -48,6 +48,7 @@ HTTPX_BIN = resolve_tool("httpx", verify_string="projectdiscovery")
 GOWITNESS_BIN = resolve_tool("gowitness")
 NMAP_BIN = shutil.which("nmap")
 NUCLEI_BIN = shutil.which("nuclei")
+FEROXBUSTER_BIN = shutil.which("feroxbuster")
 
 
 def parse_args():
@@ -177,6 +178,94 @@ def run_httpx(subdomains, run_dir):
     return parsed_hosts
 
 
+def run_feroxbuster(live_hosts, run_dir):
+    """
+    Directory/content discovery on each live host using feroxbuster.
+    Runs after httpx (so we know which hosts are actually up) and before
+    gowitness/nuclei (so discovered paths enrich what those stages see).
+
+    feroxbuster's --json flag mixes three record types in one JSONL file:
+      - "configuration" — scan settings written at start (skip)
+      - "statistics"   — summary counts written at end (skip)
+      - "response"     — actual URL hits (keep these)
+    We filter strictly on type == "response" before extracting any fields.
+    """
+    if not FEROXBUSTER_BIN:
+        print("[!] feroxbuster not found — skipping content discovery")
+        return []
+
+    # Common wordlist — present on Kali, most Debian-based systems
+    # feroxbuster also accepts a URL wordlist if this path doesn't exist
+    wordlist = "/usr/share/wordlists/dirb/common.txt"
+    if not os.path.isfile(wordlist):
+        print(f"[!] Wordlist not found at {wordlist} — skipping feroxbuster")
+        return []
+
+    ferox_dir = os.path.join(run_dir, "feroxbuster")
+    os.makedirs(ferox_dir, exist_ok=True)
+
+    all_findings = []
+
+    for host in live_hosts:
+        url = host.get("url", "")
+        if not url:
+            continue
+
+        # feroxbuster expects a URL with a scheme — httpx output already
+        # includes this, so we can use it directly without transformation
+        safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', url)
+        jsonl_out = os.path.join(ferox_dir, f"{safe_name}.jsonl")
+
+        run_command([
+            FEROXBUSTER_BIN,
+            "-u", url,
+            "-w", wordlist,
+            "--json", "-o", jsonl_out,
+            "--no-state",   # don't litter .state files
+            "-q",           # no animated progress bars in output
+            "-d", "1",      # depth 1 — one level below root; raise if you want deeper
+            "-t", "20",     # 20 threads per host — reasonable, not aggressive
+            "--time-limit", "3m",   # hard cap per host
+        ], timeout=200)
+
+        host_findings = []
+        if os.path.isfile(jsonl_out):
+            with open(jsonl_out) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    # Only keep actual URL hits — skip config and statistics records
+                    if record.get("type") != "response":
+                        continue
+                    hit_url = record.get("url")
+                    if not hit_url:
+                        continue
+                    if record.get("status") in (404, 400, 500):
+                        continue 
+                    host_findings.append({
+                        "url": hit_url,
+                        "status": record.get("status"),
+                        "content_length": record.get("content_length"),
+                    })
+
+        if host_findings:
+            print(f"[+] feroxbuster found {len(host_findings)} paths on {url}")
+        all_findings.extend(host_findings)
+
+    # Save full combined results
+    summary_file = os.path.join(ferox_dir, "feroxbuster_summary.json")
+    with open(summary_file, "w") as f:
+        json.dump(all_findings, f, indent=2)
+
+    print(f"[+] feroxbuster total: {len(all_findings)} paths across all hosts -> {summary_file}")
+    return all_findings
+
+
 def run_gowitness(run_dir):
     urls_file = os.path.join(run_dir, "live_urls.txt")
     screenshot_dir = os.path.join(run_dir, "screenshots")
@@ -293,13 +382,23 @@ def run_nmap(live_hosts, run_dir, max_workers=5):
 
 
 
-def build_report(domain, run_dir, subdomains, live_hosts, gowitness_jsonl, nmap_results, nuclei_findings):
+def build_report(domain, run_dir, subdomains, live_hosts, gowitness_jsonl, nmap_results, nuclei_findings, ferox_findings=None):
     """
     Join subfinder + httpx + gowitness + nmap + nuclei results into one report.
     Joins are by shared key: httpx<->nmap on IP, httpx<->gowitness on URL,
     httpx<->nuclei on URL prefix (nuclei's matched-at often includes a path).
     """
     nmap_by_ip = {r["ip"]: r["open_ports"] for r in nmap_results}
+    ferox_findings = ferox_findings or []
+    # Index feroxbuster hits by base URL — same prefix-match pattern as nuclei
+    ferox_by_base = {}
+    for hit in ferox_findings:
+        hit_url = hit.get("url", "")
+        for host in live_hosts:
+            base = host.get("url", "")
+            if hit_url.startswith(base):
+                ferox_by_base.setdefault(base, []).append(hit)
+                break
 
     screenshots_by_url = {}
     if os.path.isfile(gowitness_jsonl):
@@ -338,6 +437,7 @@ def build_report(domain, run_dir, subdomains, live_hosts, gowitness_jsonl, nmap_
             "open_ports": nmap_by_ip.get(ip, []),
             "screenshot": screenshot,
             "vulnerabilities": host_vulns,
+            "discovered_paths": ferox_by_base.get(url, []),
         })
 
     report = {
@@ -346,6 +446,7 @@ def build_report(domain, run_dir, subdomains, live_hosts, gowitness_jsonl, nmap_
         "total_subdomains": len(subdomains),
         "total_live_hosts": len(live_hosts),
         "total_vulnerabilities": len(nuclei_findings),
+        "total_paths_discovered": len(ferox_findings),
         "hosts": combined_hosts,
     }
 
@@ -361,6 +462,7 @@ def build_report(domain, run_dir, subdomains, live_hosts, gowitness_jsonl, nmap_
         f"- **Subdomains found:** {report['total_subdomains']}",
         f"- **Live hosts:** {report['total_live_hosts']}",
         f"- **Vulnerabilities (medium+):** {report['total_vulnerabilities']}",
+        f"- **Paths discovered:** {report['total_paths_discovered']}",
         "",
         "## Hosts",
         "",
@@ -377,6 +479,10 @@ def build_report(domain, run_dir, subdomains, live_hosts, gowitness_jsonl, nmap_
             lines.append("- **Open ports:** none found / not scanned")
         if h["screenshot"]:
             lines.append(f"- **Screenshot:** `screenshots/{h['screenshot']}`")
+        if h["discovered_paths"]:
+            lines.append("- **Discovered paths:**")
+            for path in h["discovered_paths"]:
+                lines.append(f"  - `[{path['status']}]` {path['url']}")
         if h["vulnerabilities"]:
             lines.append("- **Vulnerabilities:**")
             for v in h["vulnerabilities"]:
@@ -461,6 +567,7 @@ def main():
     print(f"[*] gowitness     : {GOWITNESS_BIN or 'NOT FOUND'}")
     print(f"[*] nmap          : {NMAP_BIN or 'NOT FOUND'}")
     print(f"[*] nuclei        : {NUCLEI_BIN or 'NOT FOUND'}")
+    print(f"[*] feroxbuster   : {FEROXBUSTER_BIN or 'NOT FOUND'}")
 
     if args.domain:
         subdomains = run_subfinder(args.domain, run_dir)
@@ -484,13 +591,14 @@ def main():
 
     gowitness_jsonl = run_gowitness(run_dir)
     if args.passive:
-        print("[*] --passive set: skipping nmap and nuclei, no active traffic will be sent")
-        nmap_results, nuclei_findings = [], []
+        print("[*] --passive set: skipping feroxbuster, nmap and nuclei, no active traffic will be sent")
+        ferox_findings, nmap_results, nuclei_findings = [], [], []
     else:
+        ferox_findings = run_feroxbuster(live_hosts, run_dir) if confirm_active_recon("feroxbuster (content discovery)", args.yes) else []
         nmap_results = run_nmap(live_hosts, run_dir) if confirm_active_recon("nmap (port scan)", args.yes) else []
         nuclei_findings = run_nuclei(run_dir) if confirm_active_recon("nuclei (vulnerability scan)", args.yes) else []
 
-    report = build_report(label, run_dir, subdomains, live_hosts, gowitness_jsonl, nmap_results, nuclei_findings)
+    report = build_report(label, run_dir, subdomains, live_hosts, gowitness_jsonl, nmap_results, nuclei_findings, ferox_findings)
 
     print(f"\n[OK] Recon complete for {label}")
     print(f"[OK] {report['total_subdomains']} subdomains, {report['total_live_hosts']} live hosts")
